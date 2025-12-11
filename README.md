@@ -79,6 +79,6 @@ Runs automatically every **15 minutes**.
 Clone this repository:
 
 ```bash
-git clone [https://github.com/nazrulislambhat/shop-health-monitor-for-wordpress-woocommerce.git]
+git clone https://github.com/nazrulislambhat/shop-health-monitor-for-wordpress-woocommerce.git
 
 ```
