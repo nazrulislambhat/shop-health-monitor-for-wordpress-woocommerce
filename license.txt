@@ -1,0 +1,87 @@
+=== Shop Health Monitor for WooCommerce ===
+Contributors: Nazrul Islam
+Tags: woocommerce, cache, litespeed, monitoring, uptime, alerts, slack, email, product-visibility
+Requires at least: 5.0
+Tested up to: 6.9
+Requires PHP: 7.4
+Stable tag: 1.2
+License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+
+== Description ==
+
+A lightweight yet powerful monitoring tool that protects your WooCommerce store from the common “blank shop / 0 products showing” issue caused by caching problems, hosting instability, or WooCommerce query failures.
+
+This plugin continuously checks whether your WooCommerce storefront is correctly returning products. If it detects a failure (0 products), it automatically:
+
+⚠ Sends an **instant failure alert** (email + Slack optional)  
+⚡ Flushes LiteSpeed Cache  
+🔁 Runs an **immediate recovery check** after purge  
+✅ Sends a **success/recovery alert instantly** if products reappear  
+📊 Updates a dedicated **Dashboard Health Widget**  
+
+Perfect for stores suffering from intermittent visibility issues or cache corruption, especially on LiteSpeed-based hosting.
+
+### Key Features
+
+- Detects when WooCommerce returns **zero products**
+- Auto-flushes **LiteSpeed Cache**
+- Sends **Failure Alerts** via email + Slack
+- NEW: **Immediate Recovery Check** (within seconds of purge)
+- Sends **Recovery Alerts** immediately when products return
+- Dashboard widget shows:
+  - Current store status  
+  - Last check time  
+  - Last failure time  
+  - Last cache purge  
+- Manual “Run Health Check” button
+- Runs automatically every **15 minutes**
+- Zero configuration required to start monitoring
+
+== Installation ==
+
+1. Upload the plugin files to `/wp-content/plugins/shop-health-monitor-for-woocommerce/`
+2. Activate the plugin through the **Plugins** menu in WordPress.
+3. (Optional) Go to **Settings → Shop Health Monitor** and enter your Slack Webhook URL.
+4. Monitoring begins automatically.
+
+== Frequently Asked Questions ==
+
+= Does the plugin work without LiteSpeed Cache? =  
+Yes, the plugin still monitors product visibility. Cache auto-flush requires LiteSpeed Cache.
+
+= Will this spam me with emails every 15 minutes? =  
+No — alerts are only sent during:
+- Actual failures (products disappear)  
+- Recoveries (products return)  
+
+Never during stable conditions.
+
+= Does it support other caching plugins? =  
+Currently optimized for LiteSpeed Cache. Support for additional cache systems may be added later.
+
+= Is the plugin resource-heavy? =  
+No. It performs a tiny WooCommerce query every 15 minutes, making it extremely light.
+
+== Changelog ==
+
+= 1.2 =  
+* Added Immediate Recovery Check (detects product return immediately after cache purge)  
+* Improved cache flush timestamp logging  
+* Enhanced failure detection logic  
+
+== Screenshots ==
+
+1. Dashboard widget displaying health status, last checks, and actions.
+
+== License ==
+
+This plugin is free software; you can redistribute it and/or modify it under the terms of the **GNU General Public License version 2 (GPLv2)** or later.
+
+This program is distributed in the hope that it will be useful,  
+but WITHOUT ANY WARRANTY; without even the implied warranty of  
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the  
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License  
+along with this program. If not, see https://www.gnu.org/licenses/gpl-2.0.html.
