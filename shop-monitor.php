@@ -2,10 +2,9 @@
 /*
 Plugin Name: Shop Health Monitor for WooCommerce
 Plugin URI: https://nazrulislam.dev/products/shop-health-monitor-woocommerce
-Description: Monitors WooCommerce shop health every minute. Performs lightweight checks normally and reacts only when products disappear.
-Version: 1.5.1
+Description: Monitors WooCommerce shop health every minute. Detects DB + frontend cache failures, auto-recovers, and alerts immediately.
+Version: 1.6.0
 Author: Nazrul Islam
-Author URI: https://nazrulislam.dev/
 License: GPLv2 or later
 */
 
@@ -14,129 +13,159 @@ if (!defined('ABSPATH')) exit;
 class Woo_Shop_Health_Monitor {
 
     private $slack_webhook;
-    private $check_interval;
 
     public function __construct() {
 
-        $this->slack_webhook  = get_option('woo_shop_slack_webhook');
-        $this->check_interval = 1; // HARD ENFORCED: every minute
+        $this->slack_webhook = get_option('woo_shop_slack_webhook');
 
         /* CRON */
         add_action('plugins_loaded', [$this, 'register_cron']);
         add_action('woo_shop_monitor_event', [$this, 'run_monitor']);
         add_action('woo_shop_monitor_recovery_event', [$this, 'run_recovery_check']);
 
-        /* Admin / UI */
+        /* ADMIN */
         add_action('wp_dashboard_setup', [$this, 'add_dashboard_widget']);
-        add_action('admin_init',         [$this, 'handle_manual_actions']);
-        add_action('admin_menu',         [$this, 'add_settings_page']);
+        add_action('admin_init', [$this, 'handle_manual_actions']);
+        add_action('admin_menu', [$this, 'add_settings_page']);
     }
 
     /* ----------------------------------------------------
-     * CRON REGISTRATION (EVERY MINUTE)
+     * CRON (EVERY MINUTE)
      * ---------------------------------------------------- */
     public function register_cron() {
 
         add_filter('cron_schedules', function ($schedules) {
-
             $schedules['woo_monitor_every_minute'] = [
                 'interval' => 60,
-                'display'  => __('Every Minute (Shop Monitor)', 'shop-health-monitor'),
+                'display'  => 'Every Minute (Shop Monitor)',
             ];
-
             return $schedules;
         });
 
         if (!wp_next_scheduled('woo_shop_monitor_event')) {
             wp_schedule_event(time(), 'woo_monitor_every_minute', 'woo_shop_monitor_event');
+            $this->log_incident('info', 'Cron registered automatically.');
         }
     }
 
     /* ----------------------------------------------------
-     * MAIN MONITOR (LIGHTWEIGHT)
+     * MAIN MONITOR
      * ---------------------------------------------------- */
     public function run_monitor() {
 
         if (!class_exists('WooCommerce')) return;
 
-        // Ultra-lightweight check
+        update_option('woo_shop_last_check', wp_date('Y-m-d H:i:s'));
+
+        /* DB CHECK */
         $products = wc_get_products([
             'status' => 'publish',
             'limit'  => 1,
         ]);
 
-        $current_status  = empty($products) ? 'empty' : 'ok';
+        $db_empty = empty($products);
+
+        /* FRONTEND / SHOP QUERY CHECK */
+        $shop_empty = $this->is_shop_query_empty();
+
+        $current_status  = ($db_empty || $shop_empty) ? 'empty' : 'ok';
         $previous_status = get_option('woo_shop_status', 'unknown');
 
-        update_option('woo_shop_last_check', wp_date('Y-m-d H:i:s'));
         update_option('woo_shop_status', $current_status);
 
         /* ----------------------------------
-         * FAILURE: OK → EMPTY
+         * CACHE DESYNC (MOST COMMON FAILURE)
+         * ---------------------------------- */
+        if (!$db_empty && $shop_empty) {
+
+            $this->log_incident(
+                'warning',
+                'Shop empty but products exist. Cache desync detected.'
+            );
+
+            $this->flush_shop_cache();
+
+            $this->send_alerts(
+                '⚠ WooCommerce Cache Desync',
+                "Shop page empty while products exist.\nCache flushed.\n" . home_url()
+            );
+
+            update_option('woo_shop_last_fail', wp_date('Y-m-d H:i:s'));
+
+            return;
+        }
+
+        /* ----------------------------------
+         * HARD FAILURE (OK → EMPTY)
          * ---------------------------------- */
         if ($previous_status !== 'empty' && $current_status === 'empty') {
 
             update_option('woo_shop_last_fail', wp_date('Y-m-d H:i:s'));
 
-            // 🔔 OPTION A: Notify immediately (even if auto-fix works)
             $this->log_incident('failure', 'Zero products detected. Auto-recovery started.');
 
-            wp_mail(
-                get_option('admin_email'),
-                '⚠ WooCommerce Issue Detected (Auto-Fix Started)',
-                "Zero products detected.\nAuto-recovery (cache flush) initiated.\n\nTime: " . wp_date('Y-m-d H:i:s'),
-                ['Content-Type: text/plain; charset=UTF-8']
-            );
-
-            $this->send_slack_alert(
-                "⚠ *WooCommerce Issue Detected*\nProducts missing.\nAuto-recovery started.\n" . home_url()
-            );
-
-            // 🧹 Flush cache
             $this->flush_shop_cache();
-            update_option('woo_shop_last_flush', wp_date('Y-m-d H:i:s'));
 
-            // 🔥 Schedule NON-BLOCKING recovery check
+            $this->send_alerts(
+                '⚠ WooCommerce Products Missing',
+                "Zero products detected.\nAuto-recovery started.\n" . home_url()
+            );
+
             if (!wp_next_scheduled('woo_shop_monitor_recovery_event')) {
-                wp_schedule_single_event(
-                    time() + 10,
-                    'woo_shop_monitor_recovery_event'
-                );
+                wp_schedule_single_event(time() + 10, 'woo_shop_monitor_recovery_event');
             }
 
             return;
         }
 
         /* ----------------------------------
-         * NORMAL RECOVERY (EMPTY → OK)
+         * NORMAL RECOVERY
          * ---------------------------------- */
         if ($previous_status === 'empty' && $current_status === 'ok') {
 
-            $this->log_incident('recovery', 'Recovered on next scheduled check.');
+            $this->log_incident('recovery', 'Shop recovered.');
 
-            wp_mail(
-                get_option('admin_email'),
+            $this->send_alerts(
                 '✅ WooCommerce Shop Recovered',
-                "Products are visible again.\nTime: " . wp_date('Y-m-d H:i:s'),
-                ['Content-Type: text/plain; charset=UTF-8']
+                "Products are visible again."
             );
+        }
 
+        /* ----------------------------------
+         * HEARTBEAT (STALL DETECTION)
+         * ---------------------------------- */
+        $last = strtotime(get_option('woo_shop_last_check', ''));
+        if ($last && time() - $last > 300) {
             $this->send_slack_alert(
-                "✅ *WooCommerce Shop Recovered*\nProducts are visible again."
+                "🚨 *Shop Monitor Stalled*\nNo checks in last 5 minutes."
             );
         }
     }
 
     /* ----------------------------------------------------
-     * RECOVERY CHECK (RUNS ONLY ON FAILURE)
+     * SHOP QUERY (CACHE-SENSITIVE)
+     * ---------------------------------------------------- */
+    private function is_shop_query_empty() {
+
+        if (!function_exists('wc_get_page_id')) return false;
+
+        $query = new WP_Query([
+            'post_type'      => 'product',
+            'post_status'    => 'publish',
+            'posts_per_page' => 1,
+            'meta_query'     => WC()->query->get_meta_query(),
+            'tax_query'      => WC()->query->get_tax_query(),
+        ]);
+
+        return !$query->have_posts();
+    }
+
+    /* ----------------------------------------------------
+     * RECOVERY CHECK
      * ---------------------------------------------------- */
     public function run_recovery_check() {
 
-        if (!class_exists('WooCommerce')) return;
-
-        if (get_option('woo_shop_status') !== 'empty') {
-            return;
-        }
+        if (get_option('woo_shop_status') !== 'empty') return;
 
         $products = wc_get_products([
             'status' => 'publish',
@@ -148,15 +177,9 @@ class Woo_Shop_Health_Monitor {
             update_option('woo_shop_status', 'ok');
             $this->log_incident('recovery', 'Immediate recovery after cache flush.');
 
-            wp_mail(
-                get_option('admin_email'),
-                '✅ WooCommerce Shop Recovered Immediately',
-                "Products recovered immediately after cache flush.",
-                ['Content-Type: text/plain; charset=UTF-8']
-            );
-
-            $this->send_slack_alert(
-                "✅ *Immediate Recovery*\nProducts visible again after cache purge."
+            $this->send_alerts(
+                '✅ Immediate Recovery',
+                'Products visible again after cache purge.'
             );
         }
     }
@@ -176,19 +199,43 @@ class Woo_Shop_Health_Monitor {
             $flushed[] = 'WP Rocket';
         } elseif (function_exists('w3tc_flush_all')) {
             w3tc_flush_all();
-            $flushed[] = 'W3 Total Cache';
+            $flushed[] = 'W3TC';
         } elseif (class_exists('autoptimizeCache')) {
             \autoptimizeCache::clearall();
             $flushed[] = 'Autoptimize';
-        } elseif (function_exists('wp_cache_clear_cache')) {
-            wp_cache_clear_cache();
-            $flushed[] = 'WP Super Cache';
         } else {
             wp_cache_flush();
-            $flushed[] = 'WP Object Cache';
+            $flushed[] = 'Object Cache';
         }
 
+        update_option('woo_shop_last_flush', wp_date('Y-m-d H:i:s'));
         $this->log_incident('info', 'Cache flushed: ' . implode(', ', $flushed));
+    }
+
+    /* ----------------------------------------------------
+     * ALERTS
+     * ---------------------------------------------------- */
+    private function send_alerts($subject, $message) {
+
+        wp_mail(
+            get_option('admin_email'),
+            $subject,
+            $message,
+            ['Content-Type: text/plain; charset=UTF-8']
+        );
+
+        $this->send_slack_alert("*{$subject}*\n{$message}");
+    }
+
+    private function send_slack_alert($message) {
+
+        if (!$this->slack_webhook) return;
+
+        wp_remote_post($this->slack_webhook, [
+            'headers' => ['Content-Type' => 'application/json'],
+            'body'    => wp_json_encode(['text' => $message]),
+            'timeout' => 5,
+        ]);
     }
 
     /* ----------------------------------------------------
@@ -208,20 +255,7 @@ class Woo_Shop_Health_Monitor {
     }
 
     /* ----------------------------------------------------
-     * SLACK
-     * ---------------------------------------------------- */
-    private function send_slack_alert($message) {
-
-        if (!$this->slack_webhook) return;
-
-        wp_remote_post($this->slack_webhook, [
-            'headers' => ['Content-Type' => 'application/json'],
-            'body'    => wp_json_encode(['text' => $message]),
-        ]);
-    }
-
-    /* ----------------------------------------------------
-     * DASHBOARD WIDGET
+     * DASHBOARD
      * ---------------------------------------------------- */
     public function add_dashboard_widget() {
 
@@ -234,25 +268,21 @@ class Woo_Shop_Health_Monitor {
 
     public function render_dashboard_widget() {
 
-        $status     = get_option('woo_shop_status', 'unknown');
-        $last_check = get_option('woo_shop_last_check', 'Never');
-        $log        = get_option('woo_shop_incident_log', []);
+        echo '<p><strong>Status:</strong> ' . esc_html(get_option('woo_shop_status', 'unknown')) . '</p>';
+        echo '<p><strong>Last Check:</strong> ' . esc_html(get_option('woo_shop_last_check', 'Never')) . '</p>';
 
-        echo "<p><strong>Status:</strong> {$status}</p>";
-        echo "<p><strong>Check Interval:</strong> Every minute</p>";
-        echo "<p><strong>Last Check:</strong> {$last_check}</p>";
-
-        if (!empty($log)) {
-            echo '<hr><strong>Recent Events:</strong><ul>';
-            foreach (array_slice($log, 0, 3) as $entry) {
-                echo "<li>[{$entry['time']}] <strong>{$entry['type']}:</strong> {$entry['message']}</li>";
+        $log = get_option('woo_shop_incident_log', []);
+        if ($log) {
+            echo '<hr><ul>';
+            foreach (array_slice($log, 0, 3) as $e) {
+                echo "<li>[{$e['time']}] <strong>{$e['type']}:</strong> {$e['message']}</li>";
             }
             echo '</ul>';
         }
 
         echo '<p>
-            <a class="button button-primary" href="' . admin_url('?woo_manual_shop_check=1') . '">🧪 Run Check</a>
-            <a class="button" style="margin-left:5px;color:#d63638;" href="' . admin_url('?woo_manual_test_alerts=1') . '">⚡ Test Alerts</a>
+            <a class="button button-primary" href="' . admin_url('?woo_manual_shop_check=1') . '">Run Check</a>
+            <a class="button" style="margin-left:6px;color:#d63638;" href="' . admin_url('?woo_manual_test_alerts=1') . '">Test Alerts</a>
         </p>';
     }
 
@@ -265,31 +295,21 @@ class Woo_Shop_Health_Monitor {
 
         if (isset($_GET['woo_manual_shop_check'])) {
             do_action('woo_shop_monitor_event');
-            wp_die('Manual check completed.<br><a href="' . admin_url() . '">Back</a>');
+            wp_die('Manual check completed.');
         }
 
         if (isset($_GET['woo_manual_test_alerts'])) {
 
             $this->log_incident('test', 'Manual test alert triggered.');
             $this->flush_shop_cache();
+            $this->send_alerts('[TEST] Shop Monitor', 'This is a test alert.');
 
-            wp_mail(
-                get_option('admin_email'),
-                '[TEST] Shop Monitor Alert',
-                'This is a manual test alert.',
-                ['Content-Type: text/plain; charset=UTF-8']
-            );
-
-            $this->send_slack_alert(
-                "🧪 *TEST ALERT*\nManual test alert triggered."
-            );
-
-            wp_die('Test alert sent.<br><a href="' . admin_url() . '">Back</a>');
+            wp_die('Test alert sent.');
         }
     }
 
     /* ----------------------------------------------------
-     * SETTINGS PAGE
+     * SETTINGS
      * ---------------------------------------------------- */
     public function add_settings_page() {
 
@@ -305,15 +325,12 @@ class Woo_Shop_Health_Monitor {
     public function render_settings_page() {
 
         if (isset($_POST['save'])) {
-
             check_admin_referer('woo_shop_monitor');
             update_option('woo_shop_slack_webhook', sanitize_text_field($_POST['webhook']));
-
-            echo '<div class="updated"><p>Settings saved</p></div>';
+            echo '<div class="updated"><p>Settings saved.</p></div>';
         }
 
-        $webhook = get_option('woo_shop_slack_webhook', '');
-        $log     = get_option('woo_shop_incident_log', []);
+        $webhook = esc_attr(get_option('woo_shop_slack_webhook', ''));
 
         echo '<div class="wrap"><h1>Woo Shop Health Monitor</h1>
         <form method="post">';
@@ -322,30 +339,11 @@ class Woo_Shop_Health_Monitor {
         <table class="form-table">
             <tr>
                 <th>Slack Webhook</th>
-                <td><input type="text" name="webhook" value="' . esc_attr($webhook) . '" class="large-text"></td>
+                <td><input type="text" name="webhook" value="' . $webhook . '" class="large-text"></td>
             </tr>
         </table>
         <p><button name="save" class="button-primary">Save</button></p>
-        </form>';
-
-        echo '<hr><h2>Incident History</h2>';
-
-        if (empty($log)) {
-            echo '<p>No incidents recorded.</p>';
-        } else {
-            echo '<table class="widefat striped">
-                <thead><tr><th>Time</th><th>Type</th><th>Message</th></tr></thead><tbody>';
-            foreach ($log as $entry) {
-                echo "<tr>
-                    <td>{$entry['time']}</td>
-                    <td>{$entry['type']}</td>
-                    <td>{$entry['message']}</td>
-                </tr>";
-            }
-            echo '</tbody></table>';
-        }
-
-        echo '</div>';
+        </form></div>';
     }
 }
 
